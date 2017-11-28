@@ -1,0 +1,195 @@
+---
+title: "R Notebook"
+output: 
+  html_document: 
+    fig_height: 18
+---
+
+# Load packages
+
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(magrittr)
+  library(lubridate)
+  library(bigrquery)
+  library(DBI)
+  library(sp)
+  library(tmap)
+  library(sf)
+})
+```
+
+```{r}
+chile_catches <- read.csv("chile_landings_with_GFW.csv", stringsAsFactors = F, na.strings = "null")
+
+unique_spp <- data.frame(Species = unique(chile_catches$Species), stringsAsFactors = F) %>% 
+  mutate(Spp_id = seq(1:82))
+
+Species2 <-  gsub(pattern = "ESPA.....", replacement = "ESPANOLA", x = unique_spp$Species)
+
+chile_by_spp <- chile_catches %>% 
+  left_join(unique_spp, by = "Species") %>% 
+  spread(Spp_id, Ton, fill = 0.0) %>% 
+  group_by(trip_id) %>% 
+  summarize_at(.vars = c(32:113), .funs = sum) %>% 
+  magrittr::set_colnames(c("trip_id", Species2)) %>% 
+  mutate(Total = rowSums(.) - trip_id) %>%
+  select(trip_id, Total)
+
+chile_final <- read.csv("chile_landings_with_GFW.csv", stringsAsFactors = F, na.strings = "null") %>% 
+  select(-c(Species, Ton, X1)) %>% 
+  unique() %>% 
+  left_join(chile_by_spp, by = "trip_id") %>%
+  mutate(Capacity = round(Capacity))
+
+write.csv(chile_final, file = "chile_catches_by_spp.csv", row.names = F, na = "")
+
+```
+
+
+```{r, eval = F}
+BQ_connection <-  DBI::dbConnect(bigrquery::dbi_driver(), 
+                            dataset = "jc_bycatch", 
+                            project = "ucsb-gfw", 
+                            allowLargeResults = TRUE)
+```
+
+```{eval = F}
+SELECT
+  c.RPI AS RPI,
+  c.Year AS year,
+  c.Total AS Total,
+  c.Fishing_gear AS fishing_gear,
+  c.V_name AS vessel_name,
+  c.Length AS length,
+  c.Width AS width,
+  c.Capacity AS capacity,
+  c.GTR AS gross_tons,
+  c.Power AS power,
+  c.aux_power AS aux_power,
+  c.trip_id AS trip_id,
+  c.Departure AS departure,
+  c.Arrival AS arrival,
+  c.trip_days AS trip_days,
+  n.mmsi AS mmsi,
+  d.timestamp AS timestamp,
+  d.lon AS lon,
+  d.lat AS lat,
+  d.hours AS hours,
+  d.nnet_score AS nnet_score,
+  d.implied_speed AS implied_speed,
+  d.flag_iso3 AS flagg_iso3,
+  d.eez_iso3 AS eez_3,
+  d.iso3 AS iso3
+FROM
+  [ucsb-gfw:jc_bycatch.chile_spread_spp] AS c
+INNER JOIN (
+  SELECT
+    n.mmsi,
+    shipname,
+    timestamp,
+    lon,
+    lat,
+    hours,
+    nnet_score,
+    implied_speed,
+    flag_iso3,
+    year,
+    iso3,
+    eez_iso3
+  FROM (
+    SELECT
+      mmsi,
+      timestamp,
+      YEAR(timestamp) AS myYear,
+      lon,
+      lat,
+      hours,
+      nnet_score,
+      implied_speed,
+      flag_iso3,
+      distance_from_shore,
+      eez_iso3
+    FROM
+      [world-fishing-827:gfw_research.nn]) AS n
+  INNER JOIN
+    [world-fishing-827:gfw_research.vessel_info] AS v
+  ON
+    n.mmsi = v.mmsi
+    AND n.myYear = v.year
+  WHERE
+    n.eez_iso3 = 'CHL'
+    AND n.distance_from_shore > 0.1) AS d
+ON
+  c.V_name = d.shipname
+  AND c.Year = d.year
+WHERE
+  DATE(timestamp) BETWEEN DATE(Departure)
+  AND DATE(Arrival)
+ORDER BY year, trip_id
+```
+
+```{r}
+datos <- read.csv("chile_trips_GFW.csv", stringsAsFactors = F, na.strings = "null")
+```
+
+```{r}
+t <- datos %>% 
+  filter(vessel_name == "DON JULIO") %>% 
+  mutate(myid = as.numeric(rownames(.))) %>% 
+  filter(myid %% 10 == 0)
+```
+
+```{r}
+proj2 <- "+proj=longlat +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +no_defs"
+
+data("World")
+chile <- World[World$name %in% c("Chile", "Argentina", "Peru", "Bolivia"),] %>% 
+  spTransform(proj2) %>% 
+  as("sf")
+```
+
+```{r}
+eez <- read_sf(quiet = T, dsn = "./Spatial", layer = "eez")
+
+eez_b <- read_sf(quiet = T, dsn = "./Spatial", layer = "eez_boundaries")
+```
+
+
+
+```{r}
+xy <- data.frame(X = t$lon, Y = t$lat)
+coordinates(xy) <- c("X", "Y")
+proj4string(xy) <- proj2  ## for example
+res <- sp::SpatialPointsDataFrame(coords = xy, data = t, proj4string = proj2) %>% 
+  as("sf")
+```
+
+
+```{r}
+# plot(chile[1], main = "Siguiendo a DON JULIO", col = "gray")
+# plot(res[13], add = T)
+
+ggplot(chile) +
+  geom_sf() +
+  geom_sf(data = res, aes(color = as.factor(trip_id)), alpha = 0.5) +
+  theme_bw() + 
+  ggtitle("Siguiendo a Don Julio") +
+  theme(legend.position = "None") + 
+  facet_wrap(~year)
+```
+
+```{r, fig.width = 6, fig.height = 12}
+ggplot(chile) +
+  geom_sf() +
+  geom_sf(data = eez_b, color = "black") +
+  geom_point(data = t, aes(x = lon, y = lat, color = nnet_score), alpha = 0.5, size = 0.5) +
+  theme_bw() + 
+  ggtitle("Siguiendo a Don Julio") +
+  theme(legend.position = "None") + 
+  facet_wrap(~year) +
+  scale_x_continuous(limits = c(-85, -55)) +
+  scale_y_continuous(limits = c(-45, -20))
+```
+
