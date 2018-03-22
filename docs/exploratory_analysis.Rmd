@@ -12,11 +12,12 @@ suppressPackageStartupMessages({
   library(tidyverse)
   library(magrittr)
   library(lubridate)
-  library(bigrquery)
+  library(bigrquery) 
   library(DBI)
   library(sp)
   library(tmap)
   library(sf)
+  library(trelliscopejs)
 })
 ```
 
@@ -43,7 +44,7 @@ chile_final <- read.csv("chile_landings_with_GFW.csv", stringsAsFactors = F, na.
   left_join(chile_by_spp, by = "trip_id") %>%
   mutate(Capacity = round(Capacity))
 
-write.csv(chile_final, file = "chile_catches_by_spp.csv", row.names = F, na = "")
+# write.csv(chile_final, file = "chile_catches_by_spp.csv", row.names = F, na = "")
 
 ```
 
@@ -130,15 +131,18 @@ WHERE
 ORDER BY year, trip_id
 ```
 
-```{r}
+```{r, eval = F}
 datos <- read.csv("chile_trips_GFW.csv", stringsAsFactors = F, na.strings = "null")
+save(datos, file = "datos.RData")
 ```
 
 ```{r}
-t <- datos %>% 
-  filter(vessel_name == "DON JULIO") %>% 
-  mutate(myid = as.numeric(rownames(.))) %>% 
-  filter(myid %% 10 == 0)
+load("datos.RData")
+```
+
+```{r}
+dj <- datos %>% 
+  filter(vessel_name == "DON JULIO")
 ```
 
 ```{r}
@@ -151,45 +155,117 @@ chile <- World[World$name %in% c("Chile", "Argentina", "Peru", "Bolivia"),] %>%
 ```
 
 ```{r}
-eez <- read_sf(quiet = T, dsn = "./Spatial", layer = "eez")
-
-eez_b <- read_sf(quiet = T, dsn = "./Spatial", layer = "eez_boundaries")
+eez_b <- read_sf(quiet = T, dsn = "./Spatial", layer = "eez_boundaries") %>% 
+  filter(Sovereign1 %in% c("Chile", "Peru"))
 ```
 
-
-
 ```{r}
-xy <- data.frame(X = t$lon, Y = t$lat)
+xy <- data.frame(X = dj$lon, Y = dj$lat)
 coordinates(xy) <- c("X", "Y")
 proj4string(xy) <- proj2  ## for example
-res <- sp::SpatialPointsDataFrame(coords = xy, data = t, proj4string = proj2) %>% 
+res <- sp::SpatialPointsDataFrame(coords = xy, data = dj, proj4string = proj2) %>% 
   as("sf")
 ```
 
-
-```{r}
-# plot(chile[1], main = "Siguiendo a DON JULIO", col = "gray")
-# plot(res[13], add = T)
-
-ggplot(chile) +
-  geom_sf() +
-  geom_sf(data = res, aes(color = as.factor(trip_id)), alpha = 0.5) +
+```{r, eval = F}
+ggplot(data = dj) +
+  geom_sf(data = chile) +
+  geom_point(aes(x = lon, y = lat, fill = nnet_score, size = hours), alpha = 0.1, shape = 21, color = "black") +
+  geom_sf(data = eez_b, color = "black") +
   theme_bw() + 
   ggtitle("Siguiendo a Don Julio") +
-  theme(legend.position = "None") + 
+  facet_wrap(~ year)
+```
+
+```{r}
+d1 <- filter(dj, !is.na(nnet_score)) %>% 
+  mutate(lon = round(lon), lat = round(lat)) %>% 
+  group_by(year, lon, lat) %>% 
+  summarize(hours = log10(sum(hours))) 
+
+ggplot() +
+  geom_raster(data = d1, aes(x = lon, y = lat, fill = hours)) +
+  geom_sf(data = chile) +
+  geom_sf(data = eez_b, color = "black") +
+  theme_bw() + 
+  scale_fill_gradientn(colours = colorRamps::matlab.like(10)) +
   facet_wrap(~year)
 ```
 
-```{r, fig.width = 6, fig.height = 12}
-ggplot(chile) +
-  geom_sf() +
-  geom_sf(data = eez_b, color = "black") +
-  geom_point(data = t, aes(x = lon, y = lat, color = nnet_score), alpha = 0.5, size = 0.5) +
-  theme_bw() + 
-  ggtitle("Siguiendo a Don Julio") +
-  theme(legend.position = "None") + 
-  facet_wrap(~year) +
-  scale_x_continuous(limits = c(-85, -55)) +
-  scale_y_continuous(limits = c(-45, -20))
+```{r}
+chile_by_spp2 <- chile_catches %>% 
+  left_join(unique_spp, by = "Species") %>% 
+  spread(Spp_id, Ton, fill = 0.0) %>% 
+  group_by(trip_id) %>% 
+  summarize_at(.vars = c(32:113), .funs = sum) %>% 
+  magrittr::set_colnames(c("trip_id", Species2)) %>% 
+  gather(spp, spp_landings, -trip_id) %>% 
+  filter(spp_landings > 0)
 ```
+
+```{r}
+dj_spp <- dj %>%
+  left_join(chile_by_spp2, by = "trip_id")
+```
+
+```{r}
+data_for_model <- datos %>% 
+  group_by(year, vessel_name, trip_id, trip_days, length, width, gross_tons, power, total_landings) %>% 
+  summarize(total_fishing = sum(hours))
+```
+
+```{r}
+model1 <- dj_spp %>% 
+  filter(spp == "ANCHOVETA") %>% 
+  lm(target_landings ~ as.factor(year) + trip_days, data = .)
+
+model2 <- dj_spp %>% 
+  filter(spp == "ANCHOVETA", !is.na(nnet_score)) %>% 
+  group_by(year, vessel_name, trip_id, trip_days, length, width, gross_tons, power, spp, target_landings) %>% 
+  summarize(total_fishing = sum(hours)) %>% 
+  lm(target_landings ~ as.factor(year) + total_fishing, data = .)
+```
+
+```{r, results = "asis"}
+stargazer::stargazer(model1, model2, single.row = T, type = "html")
+```
+
+```{r}
+data_for_model2 <- datos %>% 
+  group_by(year, vessel_name, trip_id, trip_days, length, width, gross_tons, power, total_landings) %>% 
+  summarize(total_fishing = sum(hours)) %>% 
+  left_join(chile_by_spp2, by = "trip_id") %>% 
+  filter(!is.na(spp),
+         spp %in% c("ANCHOVETA", "JUREL", "SARDINA COMUN", "JIBIA O CALAMAR ROJO", "CABALLA", "MERLUZA DE COLA", "MERLUZA COMUN")) %>% 
+  spread(spp, spp_landings, fill = 0) %>% 
+  janitor::clean_names() %>% 
+  mutate(others = total_landings - anchoveta - jurel - sardina_comun - jibia_o_calamar_rojo - caballa - merluza_de_cola - merluza_comun)
+```
+
+
+```{r}
+model1 <- lm(anchoveta ~ as.factor(year) + trip_days + gross_tons + power + jurel + sardina_comun + jibia_o_calamar_rojo + caballa + merluza_de_cola + merluza_comun + others, data = data_for_model2)
+
+model2 <- lm(anchoveta ~ as.factor(year) + total_fishing + gross_tons + power + jurel + sardina_comun + jibia_o_calamar_rojo + caballa + merluza_de_cola + merluza_comun + others, data = data_for_model2)
+```
+
+```{r, results = "asis"}
+stargazer::stargazer(model1, model2, single.row = T, type = "html")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 

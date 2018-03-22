@@ -1,0 +1,393 @@
+---
+title: "Untitled"
+author: "Juan Carlos Villaseñor-Derbez"
+date: "last update `r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressPackageStartupMessages({
+  library(sparklyr)
+  library(magrittr)
+  library(janitor)
+  library(taxize)
+  library(tmap)
+  library(sf)
+  library(modelr)
+  library(caret)
+  library(recipes)
+  library(yardstick)
+  library(tidyposterior)
+  library(rsample)
+  library(tidyverse)
+})
+
+get_mode <- function(v) {
+   uniqv <- unique(v)
+   uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+```
+
+# Work on 2018-02-26
+
+The previous data exploration was a mess, and I need to re-start wrangling the data to have a dataset where I can actually ask many different questions.
+
+Some of the questions are:
+
+- Are `fishing hours` (from GFW) a better proxy of fishing effort than of `fishing days` (from Chilean data)?
+- Can these (along with many boatl-level) be used to predict catches?
+- How can we assign catches (reported on land) to individual points on the map?
+
+## Load data
+
+### Chile landings data
+
+```{r}
+chile_catches <- read.csv(here::here("raw_data","chile_landings_with_GFW.csv"), stringsAsFactors = F, na.strings = "null") %>% 
+  clean_names() %>% 
+  filter(matched,
+         species == "JUREL",
+         fishing_gear == "CERCO") %>% 
+  mutate(port_name = taxize_capwords(port_name, strict = T, onlyfirst = T),
+         species = taxize_capwords(species, strict = T, onlyfirst = T),
+         fishing_gear = taxize_capwords(fishing_gear, strict = T, onlyfirst = T),
+         v_name = taxize_capwords(v_name, strict = T, onlyfirst = T),
+         departure = lubridate::month(departure),
+         arrival = lubridate::month(arrival)) %>% 
+  group_by(trip_id, year, departure, arrival, zone, length, capacity, power, aux_power, trip_days, distance_traveled, max_distance_from_shore) %>% 
+  summarize(landings = sum(ton, na.rm = T)) %>% 
+  ungroup() %>% 
+  filter(landings > 1)
+```
+
+This dataset was provided by Renato, although Juan had already played with it. The file contains `r ncol(chile_catches)` variables, which include year-boat-trip-species landings data. We can identify a single trip by the boat name, the day they left port and when they returned. There are a total of `r length(unique(chile_catches$v_name))` across `r length(unique(chile_catches$year))` years. Juan was able to match some of these boats (`r length(unique(chile_catches$v_name[chile_catches$matched]))` out of `r length(unique(chile_catches$v_name))`). From these matched vessels, we have a total of `r length(unique(chile_catches$trip_id[chile_catches$matched]))` trips made, from which we can derive information.
+
+### GFW data
+
+We want to add to this data some information from GFW. This dataset contains fishing hours for each position estimated from VMS data, as well as an indication on wheather the boat was fishing or not.
+
+```{r}
+gfw_data <- readRDS("chilean_fleet_w_gfw.rds")
+```
+
+```{r}
+trip_info <- gfw_data %>% 
+  filter(nnet_score == 1,
+         between(lon, -90, -65),
+         between(lat, -60, 10)) %>%
+  group_by(mmsi, trip_id) %>% 
+  summarize(min_lat = min(lat),
+            max_lat = max(lat),
+            mean_lat = mean(lat),
+            median_lat = median(lat),
+            mode_lat = get_mode(lat),
+            min_lon = min(lon),
+            max_lon = max(lon),
+            mean_lon = mean(lon),
+            median_lon = median(lon),
+            mode_lon = get_mode(lon),
+            hours = sum(hours)) %>% 
+  ungroup() %>%
+  select(trip_id, mmsi, everything())
+
+chile_catches_full <- chile_catches %>%  
+  left_join(trip_info, by = "trip_id") %>% 
+  filter(!is.na(mmsi))
+```
+
+
+```{r}
+set.seed(43)
+chile_split <- rsample::initial_split(chile_catches_full, prop = 0.8, strata = "year")
+
+chile_train <- rsample::training(chile_split)
+
+chile_test  <- rsample::testing(chile_split)
+```
+
+```{r}
+chile_train %>% 
+  mutate(source = "train") %>% 
+  rbind(chile_test %>% mutate(source = "test")) %>% 
+  group_by(year, source) %>% 
+  count() %>% 
+  group_by(source) %>% 
+  mutate(n = n/sum(n)) %>% 
+  ungroup() %>% 
+  ggplot(aes(x = year, y = n, fill = source)) +
+  geom_col(position = "dodge")
+```
+
+
+```{r}
+chile_vfold <- rsample::vfold_cv(chile_train, v = 5, repeats = 1, strata = "year")
+```
+
+```{r}
+lm_foo <- function(dep_var, ind_vars, split) {
+  
+  formula <- as.formula(paste0(dep_var, "~", paste(ind_vars, collapse = "+")))
+  
+  fitted_lm <- lm(formula, data = rsample::analysis(split))
+  
+  lm_performance <- rsample::assessment(split) %>%
+    modelr::add_predictions(model = fitted_lm)
+  
+  lm_rq <- yardstick::rsq(lm_performance, truth = landings, estimate = pred)
+}
+```
+
+```{r}
+dep_var <- "landings"
+ind_vars <- c(".")
+
+chile_vfold %>% 
+  mutate(rsquare = map_dbl(splits, lm_foo, dep_var = dep_var, ind_vars = ind_vars)) %>% 
+  ggplot(aes(rsquare)) + 
+  geom_histogram()
+```
+
+
+```{r}
+candidate_variables <- chile_catches_full %>% 
+  select(-c(landings, mmsi, trip_id, zone)) %>% 
+  colnames()
+
+third_rule <- round(length(candidate_variables) / 3)
+  
+candidate_params <-expand.grid(mtry = c(2, third_rule, length(candidate_variables)),
+                               splitrule = c("variance", "extratrees", "maxstat")) %>%
+  as_data_frame()
+
+candidate_params
+```
+
+```{r}
+chile_recipe <- chile_catches_full %>%
+  select(dep_var, candidate_variables) %>% 
+  recipes::recipe(landings ~ ., data = .) %>% 
+  recipes::step_log(all_outcomes()) %>% 
+  recipes::step_center(all_predictors()) %>% 
+  recipes::step_scale(all_predictors()) %>% 
+  recipes::step_meanimpute(all_predictors())
+
+chile_recipe
+```
+
+```{r}
+chile_prepped <- recipes::prep(chile_recipe, training = chile_catches_full)
+
+chile_prepped
+```
+
+
+```{r}
+chile_baked <- recipes::bake(chile_prepped, newdata = chile_catches_full)
+
+head(chile_baked)
+```
+
+```{r}
+fit_forests <-   function(mtry, splitrule, splits, candidate_variables, my_recipe){
+  
+  test_ranger <- function(split, candidate_variables, mtry, splitrule, my_recipe) {
+    
+    analysis_data <- rsample::analysis(split)
+    
+    prepped_recipe <-recipes::prep(my_recipe, training = analysis_data)
+    
+    analysis_data <- bake(prepped_recipe, newdata = analysis_data)
+    
+    assessment_data <- bake(prepped_recipe, newdata = rsample::assessment(split))
+  
+    fitted_forest <- ranger::ranger(landings ~ ., data = analysis_data, mtry = mtry, splitrule = splitrule)
+    
+    assessment_data$prediction = predict(fitted_forest, data = assessment_data)$predictions
+    
+    metric <- yardstick::rmse(assessment_data, truth = landings, estimate = prediction)
+  }
+  
+  splits <- splits %>%
+    mutate(fitted_forest = map_dbl(splits,
+                                   test_ranger,
+                                   candidate_variables = candidate_variables,
+                                   mtry = mtry,
+                                   splitrule = splitrule,
+                                   my_recipe = my_recipe))
+  
+  mean_metric <- mean(splits$fitted_forest)
+}
+```
+
+
+```{r}
+candidate_params <- candidate_params %>%
+  mutate(ranger_rmse = map2_dbl(mtry,
+                                splitrule,
+                                fit_forests,
+                                splits = chile_vfold,
+                                candidate_variables = candidate_variables,
+                                my_recipe = chile_recipe))
+```
+
+
+```{r}
+candidate_params <- candidate_params %>%
+  arrange(ranger_rmse)
+
+best_mtry <- candidate_params$mtry[1]
+
+best_splitrule <- candidate_params$splitrule[1]
+
+candidate_params %>%
+  ggplot(aes(splitrule, ranger_rmse, fill = factor(mtry))) +
+  geom_col(position = "dodge")
+```
+
+```{r}
+lm_foo <- function(split, ind_vars, my_recipe) {
+  formula <- as.formula(paste0("landings ~ ", paste(ind_vars, collapse = "+")))
+  
+  prepped_recipe <- recipes::prep(my_recipe, training = rsample::analysis(split))
+  
+  analysis_data <- bake(prepped_recipe, newdata = rsample::analysis(split))
+  
+  assessment_data <- bake(prepped_recipe, newdata = rsample::assessment(split))
+  
+  fitted_lm <- lm(landings ~ ., data = analysis_data)
+  
+  lm_performance <- assessment_data %>%
+  modelr::add_predictions(model = fitted_lm)
+  
+  metric <- yardstick::rmse(lm_performance, truth = landings, estimate = pred)
+}
+
+ranger_foo <- function(split, candidate_variables, dep_var, mtry, splitrule, my_recipe) {
+  analysis_data <- rsample::analysis(split)
+  
+  prepped_recipe <- recipes::prep(my_recipe, training = analysis_data)
+  
+  analysis_data <- bake(prepped_recipe, newdata = analysis_data)
+  
+  assessment_data <- bake(prepped_recipe, newdata = rsample::assessment(split))
+
+  fitted_forest <- ranger::ranger(landings ~ .,
+                                  data = analysis_data,
+                                  mtry = mtry,
+                                  splitrule = splitrule)
+  
+  assessment_data$prediction = predict(fitted_forest, data = assessment_data)$predictions
+  
+  metric <- yardstick::rmse(assessment_data, truth = landings, estimate = prediction)
+}
+
+chile_vfold <- chile_vfold %>%
+  mutate(lm_rmse = map_dbl(splits,
+                           lm_foo,
+                           ind_vars = candidate_variables,
+                           my_recipe = chile_recipe),
+         ranger_rmse = map_dbl(splits,
+                               ranger_foo,
+                               candidate_variables = candidate_variables,
+                               mtry = best_mtry,
+                               splitrule = best_splitrule,
+                               my_recipe = chile_recipe))
+
+chile_vfold
+```
+
+```{r}
+chile_performance <- chile_vfold %>%
+  perf_mod(seed = 42)
+
+forest_v_lm <- contrast_models(chile_performance, "ranger_rmse", "lm_rmse")
+
+summary(forest_v_lm)
+```
+
+```{r}
+ggplot(forest_v_lm, size = 0.1)
+```
+
+```{r}
+chile_prepped <- prep(chile_recipe, training = chile_train)
+
+fitted_forest <- ranger::ranger(
+  landings ~ .,
+  data =  bake(chile_prepped, newdata = chile_train),
+  mtry = best_mtry,
+  splitrule = best_splitrule,
+  importance = "permutation")
+
+fitted_lm <- lm(landings ~ ., data = bake(chile_prepped, newdata = chile_train))
+```
+
+```{r}
+data_frame(variable = names(ranger::importance(fitted_forest)),
+           importance = ranger::importance(fitted_forest)) %>%
+  mutate(variable = fct_reorder(variable, importance)) %>%
+  ggplot(aes(variable, importance)) +
+  geom_col() +
+  coord_flip()
+```
+
+
+```{r}
+chile_results <- bake(chile_prepped, newdata = chile_test) %>%
+  mutate(lm_pred = predict(fitted_lm, newdata = bake(chile_prepped, newdata = chile_test)),
+         forest_pred = predict(fitted_forest, data = bake(chile_prepped, newdata = chile_test))$predictions)
+
+
+chile_results %>% 
+  select(landings, lm_pred, forest_pred) %>%
+  gather(model, prediction, contains("pred")) %>% 
+  ggplot(aes(landings, prediction, color = model)) +
+  geom_point() +
+  geom_abline(aes(intercept = 0, slope = 1), color = "red") +
+  facet_wrap( ~ model)
+```
+
+```{r}
+fit_control <- trainControl(method = "repeatedcv",
+                            number = 5,
+                            repeats = 1,
+                            allowParallel = TRUE)
+
+caret_forest <- caret::train(chile_recipe,
+                             data = chile_train,
+                             method = "ranger",
+                             trControl = fit_control)
+
+
+chile_results <- chile_results %>% 
+  mutate(caret_pred = predict(caret_forest$finalModel,
+                              data = select(chile_results, candidate_variables))$predictions)
+
+chile_results %>% 
+  select(landings, lm_pred, forest_pred, caret_pred) %>%
+  gather(model, prediction, contains("pred")) %>%
+  ggplot(aes(landings, prediction, color = model)) +
+  geom_point() +
+  geom_abline(aes(intercept = 0, slope = 1), color = "red") +
+  facet_wrap( ~ model)
+```
+
+
+```{r}
+cor(chile_results$landings, chile_results$forest_pred)
+cor(chile_results$landings, chile_results$lm_pred)
+cor(chile_results$landings, chile_results$caret_pred)
+```
+
+
+
+
+
+
+
+
+
+
+

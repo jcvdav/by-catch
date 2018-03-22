@@ -1,0 +1,121 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Load packages
+
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(magrittr)
+  library(lubridate)
+  library(bigrquery)
+  library(DBI)
+  library(sp)
+  library(tmap)
+})
+```
+
+```{r}
+BQ_connection <-  DBI::dbConnect(bigrquery::dbi_driver(), 
+                            dataset = "jc_bycatch", 
+                            project = "ucsb-gfw", 
+                            allowLargeResults = TRUE)
+```
+
+```{eval = F}
+SELECT
+  c.RPI AS RPI,
+  c.Year AS year,
+  c.Species AS spp,
+  c.Ton AS tons,
+  c.Fishing_gear AS fishing_gear,
+  c.V_name AS vessel_name,
+  c.Length AS length,
+  c.Width AS width,
+  c.Capacity AS capacity,
+  c.GTR AS gross_tons,
+  c.Power AS power,
+  c.aux_power AS aux_power,
+  c.trip_id AS trip_id,
+  c.trip_days AS trip_days,
+  n.mmsi AS mmsi,
+  d.timestamp AS timestamp,
+  d.lon AS lon,
+  d.lat AS lat,
+  d.hours AS hours,
+  d.nnet_score AS nnet_score,
+  d.implied_speed AS implied_speed,
+  d.flag_iso3 AS flagg_iso3,
+  d.eez_iso3 AS eez_3,
+  d.iso3 AS iso3
+FROM
+  [ucsb-gfw:jc_bycatch.chile_w_gfw] AS c
+INNER JOIN (
+  SELECT
+    n.mmsi,
+    shipname,
+    timestamp,
+    lon,
+    lat,
+    hours,
+    nnet_score,
+    implied_speed,
+    flag_iso3,
+    year,
+    iso3,
+    eez_iso3
+  FROM (
+    SELECT
+      mmsi,
+      timestamp,
+      YEAR(timestamp) AS myYear,
+      lon,
+      lat,
+      hours,
+      nnet_score,
+      implied_speed,
+      flag_iso3,
+      distance_from_shore,
+      eez_iso3
+    FROM
+      [world-fishing-827:gfw_research.nn]) AS n
+  INNER JOIN
+    [world-fishing-827:gfw_research.vessel_info] AS v
+  ON
+    n.mmsi = v.mmsi
+    AND n.myYear = v.year
+  WHERE
+    n.eez_iso3 = 'CHL'
+    AND n.distance_from_shore > 0.1) AS d
+ON
+  c.V_name = d.shipname
+  AND c.Year = d.year
+WHERE DATE(timestamp) BETWEEN DATE(Departure) AND DATE(Arrival)
+```
+
+```{r}
+t <- read.csv("chile.csv", stringsAsFactors = F, na.strings = "null") %>% 
+  filter(year == 2015, vessel_name == "DON JULIO")
+```
+
+```{r}
+proj2 <- "+proj=longlat +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +no_defs"
+xy <- data.frame(X = t$lon, Y = t$lat)
+coordinates(xy) <- c("X", "Y")
+proj4string(xy) <- proj2  ## for example
+res <- sp::SpatialPointsDataFrame(coords = xy, data = t, proj4string = proj2) %>% 
+  as("sf")
+
+data("World")
+chile <- World[World$name == "Chile",] %>% 
+  as("sf")
+
+ggplot(res) +
+  geom_sf(data = chile) +
+  geom_sf(size = 1, aes(color = timestamp)) +
+  theme_bw()
+
+```
+
