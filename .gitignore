@@ -5,3 +5,4 @@
 .httr-oauth
 raw_data\chilean_fleet_w_gfw.csv
 raw_data\spatial
+.rds
