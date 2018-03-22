@@ -1,6 +1,6 @@
 # by-catch
 
-Repository structure
+##  Repository structure
 
 ```
 by-catch:
@@ -11,3 +11,9 @@ by-catch:
 │   └───spatial
 └───scripts
 ```
+<<<<<<< HEAD
+
+## Data sources
+
+- Chilean vessel-level trip data from [Renato Molina](renatomolinah.com)
+- Vessel tracks from [Global Fishing Watch](globalfishingwatch.org/map/)
