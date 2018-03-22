@@ -11,8 +11,6 @@ by-catch:
 │   └───spatial
 └───scripts
 ```
-<<<<<<< HEAD
-
 ## Data sources
 
 - Chilean vessel-level trip data from [Renato Molina](renatomolinah.com)
