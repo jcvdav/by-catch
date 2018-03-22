@@ -13,5 +13,5 @@ by-catch:
 ```
 ## Data sources
 
-- Chilean vessel-level trip data from [Renato Molina](renatomolinah.com)
-- Vessel tracks from [Global Fishing Watch](globalfishingwatch.org/map/)
+- Chilean vessel-level trip data from [Renato Molina](www.renatomolinah.com)
+- Vessel tracks from [Global Fishing Watch](www.globalfishingwatch.org/map/)
