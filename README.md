@@ -2,6 +2,7 @@
 
 Repository structure
 
+```
 by-catch:
 ├───data
 ├───docs
@@ -9,3 +10,4 @@ by-catch:
 ├───raw_data
 │   └───spatial
 └───scripts
+```
