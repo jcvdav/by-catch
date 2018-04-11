@@ -30,7 +30,7 @@ get_mode <- function(v) {
 }
 ```
 
-# Work on 2018-02-26
+# Test 2
 
 The previous data exploration was a mess, and I need to re-start wrangling the data to have a dataset where I can actually ask many different questions.
 
@@ -48,15 +48,19 @@ Some of the questions are:
 chile_catches <- read.csv(here::here("raw_data","chile_landings_with_GFW.csv"), stringsAsFactors = F, na.strings = "null") %>% 
   clean_names() %>% 
   filter(matched,
-         species == "JUREL",
+         species == "ANCHOVETA",
          fishing_gear == "CERCO") %>% 
   mutate(port_name = taxize_capwords(port_name, strict = T, onlyfirst = T),
          species = taxize_capwords(species, strict = T, onlyfirst = T),
          fishing_gear = taxize_capwords(fishing_gear, strict = T, onlyfirst = T),
          v_name = taxize_capwords(v_name, strict = T, onlyfirst = T),
          departure = lubridate::month(departure),
-         arrival = lubridate::month(arrival)) %>% 
-  group_by(trip_id, year, departure, arrival, zone, length, capacity, power, aux_power, trip_days, distance_traveled, max_distance_from_shore) %>% 
+         arrival = lubridate::month(arrival),
+         distance_traveled = as.numeric(distance_traveled),
+         max_distance_from_shore = as.numeric(max_distance_from_shore),
+         power = as.numeric(power),
+         aux_power = as.numeric(aux_power)) %>% 
+  group_by(trip_id, year, departure, arrival, length, capacity, power, aux_power, trip_days, distance_traveled, max_distance_from_shore) %>% 
   summarize(landings = sum(ton, na.rm = T)) %>% 
   ungroup() %>% 
   filter(landings > 1)
@@ -69,7 +73,7 @@ This dataset was provided by Renato, although Juan had already played with it. T
 We want to add to this data some information from GFW. This dataset contains fishing hours for each position estimated from VMS data, as well as an indication on wheather the boat was fishing or not.
 
 ```{r}
-gfw_data <- readRDS("chilean_fleet_w_gfw.rds")
+gfw_data <- readRDS(here::here("raw_data","chilean_fleet_w_gfw.rds"))
 ```
 
 ```{r}
@@ -152,7 +156,7 @@ chile_vfold %>%
 
 ```{r}
 candidate_variables <- chile_catches_full %>% 
-  select(-c(landings, mmsi, trip_id, zone)) %>% 
+  select(-c(landings, mmsi, trip_id, departure, arrival, year)) %>% 
   colnames()
 
 third_rule <- round(length(candidate_variables) / 3)
@@ -333,6 +337,30 @@ data_frame(variable = names(ranger::importance(fitted_forest)),
   coord_flip()
 ```
 
+Compare fit on training data
+
+```{r}
+chile_results <- bake(chile_prepped, newdata = chile_train) %>%
+  mutate(lm_pred = predict(fitted_lm, newdata = bake(chile_prepped, newdata = chile_train)),
+         forest_pred = predict(fitted_forest, data = bake(chile_prepped, newdata = chile_train))$predictions)
+
+
+chile_results %>% 
+  select(landings, lm_pred, forest_pred) %>%
+  gather(model, prediction, contains("pred")) %>% 
+  ggplot(aes(landings, prediction, color = model)) +
+  geom_point() +
+  geom_abline(aes(intercept = 0, slope = 1), color = "red") +
+  facet_wrap( ~ model) +
+  cowplot::theme_cowplot()
+```
+
+```{r}
+cor(chile_results$landings, chile_results$forest_pred)^2
+cor(chile_results$landings, chile_results$lm_pred)^2
+```
+
+Compare fit on testing data
 
 ```{r}
 chile_results <- bake(chile_prepped, newdata = chile_test) %>%
@@ -346,8 +374,15 @@ chile_results %>%
   ggplot(aes(landings, prediction, color = model)) +
   geom_point() +
   geom_abline(aes(intercept = 0, slope = 1), color = "red") +
-  facet_wrap( ~ model)
+  facet_wrap( ~ model) +
+  cowplot::theme_cowplot()
 ```
+
+```{r}
+cor(chile_results$landings, chile_results$forest_pred)^2
+cor(chile_results$landings, chile_results$lm_pred)^2
+```
+
 
 ```{r}
 fit_control <- trainControl(method = "repeatedcv",
@@ -371,7 +406,8 @@ chile_results %>%
   ggplot(aes(landings, prediction, color = model)) +
   geom_point() +
   geom_abline(aes(intercept = 0, slope = 1), color = "red") +
-  facet_wrap( ~ model)
+  facet_wrap( ~ model) +
+  cowplot::theme_cowplot()
 ```
 
 
@@ -381,6 +417,16 @@ cor(chile_results$landings, chile_results$lm_pred)
 cor(chile_results$landings, chile_results$caret_pred)
 ```
 
+# Next stepps
+
+1 Improve model fit by adding SST + Chl-a + lagrangian structures?
+2 Think of ways to include "areas" / "regions" other than min/max/mode/mean of Lat / Long
+3 Include variance of the above
+4 Apply a similar method to SSt + Chla + lagrangian
+5 Use other algorithms
+6 Two parts:
+  - Using GFW to predict catches of in-sample boats
+  - Can we use little data we have on this dataset to recreate timeseries of catches? (i.e. compare this to FAO data / SAU / official landings)
 
 
 
